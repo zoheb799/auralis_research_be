@@ -1,3 +1,4 @@
+
 fastapi
 uvicorn[standard]
 pydantic-settings
@@ -5,7 +6,7 @@ pytest
 pytest-asyncio
 httpx
 
-sqlalchemy
+sqlalchemy[asyncio]
 asyncpg
 alembic
 
