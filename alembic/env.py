@@ -10,11 +10,15 @@ from alembic import context
 config = context.config
 from app.core.config import settings
 
-config.set_main_option(
-    "sqlalchemy.url",
+database_url = (
     settings.database_url
     .replace("+asyncpg", "+psycopg2")
-    .replace("%", "%%"),
+    .replace("+psycopg://", "+psycopg2://")
+)
+
+config.set_main_option(
+    "sqlalchemy.url",
+    database_url.replace("%", "%%"),
 )
 
 # Interpret the config file for Python logging.
