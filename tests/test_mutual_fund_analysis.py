@@ -9,6 +9,7 @@ from app.analysis.mutual_fund_analysis import (
     consistency_signal,
     risk_signal,
 )
+from app.services.analysis_service import analyze_mutual_fund_data
 
 
 def test_return_signal():
@@ -127,3 +128,16 @@ def test_analyze_mutual_fund_missing_data():
     assert result["concentration"]["signal"] == "unknown"
     assert result["consistency"]["signal"] == "unknown"
     assert result["risk"]["signal"] == "unknown"
+
+
+def test_analyze_mutual_fund_data_ignores_repository_model_objects():
+    result = analyze_mutual_fund_data(
+        {
+            "asset": object(),
+            "fund": object(),
+            "expense_ratio": 0.65,
+        }
+    )
+
+    assert result.expense_ratio.expense_ratio == 0.65
+    assert result.expense_ratio.signal == "moderate"

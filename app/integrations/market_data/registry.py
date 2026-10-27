@@ -8,11 +8,22 @@ from app.integrations.market_data.base import (
     StockDataProvider,
 )
 from app.integrations.market_data.providers.mfapi import MFAPIProvider
+from app.integrations.market_data.providers.alpha_vantage import (
+    AlphaVantageFundamentalsProvider,
+)
+from app.integrations.market_data.providers.bharatstock import (
+    BharatStockFundamentalsProvider,
+)
 from app.integrations.market_data.providers.nse import (
     NSEEquityCatalogProvider,
 )
 from app.integrations.market_data.providers.tejhq import TejHQProvider
 from app.integrations.market_data.providers.xflot import XflotProvider
+
+
+StockFundamentalsProvider = (
+    AlphaVantageFundamentalsProvider | BharatStockFundamentalsProvider
+)
 
 
 class MarketDataProviderRegistry:
@@ -29,6 +40,22 @@ class MarketDataProviderRegistry:
 
     def stock_catalog(self) -> NSEEquityCatalogProvider:
         return NSEEquityCatalogProvider(self.http_client)
+
+    def stock_fundamentals(self) -> StockFundamentalsProvider:
+        provider = self.settings.market_data_fundamentals_provider.lower()
+        if provider == "bharatstock":
+            return BharatStockFundamentalsProvider(
+                self.settings,
+                self.http_client,
+            )
+        if provider == "alphavantage":
+            return AlphaVantageFundamentalsProvider(
+                self.settings,
+                self.http_client,
+            )
+        raise ProviderConfigurationError(
+            "Unsupported stock fundamentals provider"
+        )
 
     def ipos(self) -> IPODataProvider:
         if self.settings.market_data_ipo_provider.lower() != "xflot":

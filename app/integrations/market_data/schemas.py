@@ -28,6 +28,35 @@ class StockCatalogSyncSummary(NormalizedRecord):
     identifiers_linked: int
 
 
+class FinancialPeriod(NormalizedRecord):
+    period_end: date
+    consolidation_type: Literal["consolidated", "standalone"] | None = None
+    revenue: Decimal | None = None
+    operating_profit: Decimal | None = None
+    net_profit: Decimal | None = None
+    eps: Decimal | None = None
+    total_debt: Decimal | None = None
+    shareholder_equity: Decimal | None = None
+    cash: Decimal | None = None
+    roe: Decimal | None = None
+    roce: Decimal | None = None
+
+
+class StockFundamentalData(NormalizedRecord):
+    provider_symbol: str
+    source_provider: str | None = None
+    source_as_of_date: date | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    market_cap: Decimal | None = None
+    pe_ratio: Decimal | None = None
+    eps: Decimal | None = None
+    dividend_yield: Decimal | None = None
+    book_value: Decimal | None = None
+    debt_to_equity: Decimal | None = None
+    roe: Decimal | None = None
+    periods: list[FinancialPeriod] = Field(default_factory=list)
+
+
 class PriceObservation(NormalizedRecord):
     instrument_key: str
     price: Decimal = Field(gt=0)
@@ -93,6 +122,8 @@ class SyncSummary(NormalizedRecord):
     catalog_assets_inserted: int = 0
     catalog_assets_updated: int = 0
     catalog_stock_records_inserted: int = 0
+    requests_used: int = 0
+    request_budget_remaining: int | None = None
     inserted: int = 0
     updated: int = 0
     skipped: int = 0

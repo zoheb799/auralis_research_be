@@ -1,9 +1,10 @@
 import asyncio
-from datetime import datetime, time, timedelta, timezone
+import json
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, select, text, tuple_
+from sqlalchemy import and_, or_, select, text, tuple_
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,13 +12,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.db.models.asset import Asset
 from app.db.models.asset_identifier import AssetIdentifier
+from app.db.models.asset_fundamental_sync_state import AssetFundamentalSyncState
 from app.db.models.asset_price import AssetPrice
+from app.db.models.financial_metric import FinancialMetric
 from app.db.models.ipo import IPO
 from app.db.models.market_data_sync_state import MarketDataSyncState
+from app.db.models.market_data_api_usage import MarketDataAPIUsage
 from app.db.models.mutual_fund import MutualFund
 from app.db.models.stock import Stock
 from app.integrations.market_data.errors import (
     MarketDataError,
+    ProviderInstrumentNotFoundError,
     ProviderConfigurationError,
     ProviderRateLimitError,
     ProviderRequestError,
@@ -26,10 +31,12 @@ from app.integrations.market_data.errors import (
 from app.integrations.market_data.registry import MarketDataProviderRegistry
 from app.integrations.market_data.schemas import (
     FundScheme,
+    FinancialPeriod,
     IPORecord,
     NavObservation,
     PriceObservation,
     StockCatalogSyncSummary,
+    StockFundamentalData,
     StockInstrument,
     SyncSummary,
 )
@@ -41,6 +48,7 @@ class SyncAlreadyRunning(MarketDataError):
 
 class MarketDataSyncService:
     MARKET_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+    ALPHA_VANTAGE_REQUESTS_PER_STOCK = 3
 
     def __init__(
         self,
@@ -205,6 +213,413 @@ class MarketDataSyncService:
             stock_records_inserted=stock_records_inserted,
             identifiers_linked=identifiers_linked,
         )
+
+    async def sync_stock_fundamentals(
+        self,
+        *,
+        dry_run: bool = False,
+        limit: int | None = None,
+        symbol: str | None = None,
+        exchange: str | None = None,
+        retry_failed: bool = False,
+        force_refresh: bool = False,
+    ) -> SyncSummary:
+        provider = self.providers.stock_fundamentals()
+        if not dry_run:
+            required_key = (
+                self.settings.bharatstock_api_key
+                if provider.provider_name == "bharatstock"
+                else self.settings.alpha_vantage_api_key
+            )
+            if not required_key:
+                key_name = (
+                    "BHARATSTOCK_API_KEY"
+                    if provider.provider_name == "bharatstock"
+                    else "ALPHA_VANTAGE_API_KEY"
+                )
+                raise ProviderConfigurationError(
+                    f"{key_name} is required for stock fundamentals sync"
+                )
+
+        requests_per_stock = getattr(
+            provider,
+            "requests_per_stock",
+            self.ALPHA_VANTAGE_REQUESTS_PER_STOCK,
+        )
+        today = datetime.now(timezone.utc).date()
+        usage_result = await self.db.execute(
+            select(MarketDataAPIUsage.requests_used).where(
+                MarketDataAPIUsage.provider == provider.provider_name,
+                MarketDataAPIUsage.usage_date == today,
+            )
+        )
+        requests_used = usage_result.scalar_one_or_none() or 0
+        daily_limit = max(
+            0,
+            (
+                self.settings.bharatstock_daily_request_limit
+                if provider.provider_name == "bharatstock"
+                else self.settings.alpha_vantage_daily_request_limit
+            ),
+        )
+        remaining_budget = max(0, daily_limit - requests_used)
+        batch_limit = min(
+            max(1, self.settings.market_data_stock_sync_limit),
+            remaining_budget // requests_per_stock,
+        )
+        if limit is not None:
+            batch_limit = min(batch_limit, max(0, limit))
+        if batch_limit == 0:
+            return SyncSummary(
+                job="fundamentals",
+                provider=provider.provider_name,
+                request_budget_remaining=remaining_budget,
+            )
+
+        now = datetime.now(timezone.utc)
+        today_start = datetime.combine(today, time.min, tzinfo=timezone.utc)
+        refresh_before = now - timedelta(days=1)
+        unsupported_retry_before = now - timedelta(days=90)
+        eligibility = (
+            True
+            if force_refresh
+            else (
+                AssetFundamentalSyncState.asset_id.is_(None)
+                | (
+                    (AssetFundamentalSyncState.status == "success")
+                    & (
+                        AssetFundamentalSyncState.last_attempted_at
+                        < refresh_before
+                    )
+                )
+                | (
+                    (AssetFundamentalSyncState.status == "unsupported")
+                    & (
+                        AssetFundamentalSyncState.last_attempted_at
+                        < unsupported_retry_before
+                    )
+                )
+                | (
+                    (AssetFundamentalSyncState.status == "failed")
+                    & (
+                        or_(
+                            retry_failed,
+                            AssetFundamentalSyncState.last_attempted_at
+                            < today_start,
+                        )
+                    )
+                )
+            )
+        )
+        candidate_query = (
+            select(Asset.id, Asset.symbol, Asset.exchange)
+            .join(Stock, Stock.asset_id == Asset.id)
+            .outerjoin(
+                AssetFundamentalSyncState,
+                AssetFundamentalSyncState.asset_id == Asset.id,
+            )
+            .where(
+                Asset.asset_type == "stock",
+                Asset.is_active.is_(True),
+                Asset.symbol.is_not(None),
+                func.upper(Asset.exchange).in_(("NSE", "BSE")),
+                eligibility,
+            )
+            .order_by(
+                AssetFundamentalSyncState.last_attempted_at.asc().nullsfirst(),
+                Asset.symbol,
+            )
+        )
+        if symbol:
+            candidate_query = candidate_query.where(
+                func.upper(Asset.symbol) == symbol.strip().upper()
+            )
+        if exchange:
+            candidate_query = candidate_query.where(
+                func.upper(Asset.exchange) == exchange.strip().upper()
+            )
+        candidates_result = await self.db.execute(
+            candidate_query.limit(batch_limit)
+        )
+        candidates = candidates_result.all()
+        if dry_run:
+            return SyncSummary(
+                job="fundamentals",
+                provider=provider.provider_name,
+                discovered=len(candidates),
+                request_budget_remaining=remaining_budget,
+            )
+        inserted = updated = skipped = failed = processed = 0
+
+        for asset_id, symbol, exchange in candidates:
+            reserved = await self._reserve_api_requests(
+                provider=provider.provider_name,
+                usage_date=today,
+                requests=requests_per_stock,
+                daily_limit=daily_limit,
+            )
+            if not reserved:
+                break
+            try:
+                fundamentals = await provider.fetch_fundamentals(symbol, exchange)
+                added, changed = await self._persist_stock_fundamentals(
+                    asset_id,
+                    fundamentals,
+                )
+                inserted += added
+                updated += changed
+                await self._record_asset_fundamentals_sync(
+                    asset_id,
+                    status="success",
+                    error_category=None,
+                    provider=provider.provider_name,
+                    data=fundamentals,
+                )
+            except ProviderInstrumentNotFoundError as exc:
+                skipped += 1
+                await self._record_asset_fundamentals_sync(
+                    asset_id,
+                    status="unsupported",
+                    error_category=type(exc).__name__,
+                    provider=provider.provider_name,
+                )
+            except ProviderRateLimitError as exc:
+                await self._record_asset_fundamentals_sync(
+                    asset_id,
+                    status="failed",
+                    error_category=type(exc).__name__,
+                    provider=provider.provider_name,
+                )
+                raise
+            except ProviderRequestError as exc:
+                failed += 1
+                await self._record_asset_fundamentals_sync(
+                    asset_id,
+                    status="failed",
+                    error_category=type(exc).__name__,
+                    provider=provider.provider_name,
+                )
+            except ProviderResponseError as exc:
+                failed += 1
+                await self._record_asset_fundamentals_sync(
+                    asset_id,
+                    status="failed",
+                    error_category=type(exc).__name__,
+                    provider=provider.provider_name,
+                )
+            finally:
+                requests_made = provider.requests_made
+                processed += requests_made
+                unused_reservation = (
+                    requests_per_stock - requests_made
+                )
+                if unused_reservation > 0:
+                    await self._release_api_requests(
+                        provider=provider.provider_name,
+                        usage_date=today,
+                        requests=unused_reservation,
+                    )
+
+        return SyncSummary(
+            job="fundamentals",
+            provider=provider.provider_name,
+            discovered=len(candidates),
+            inserted=inserted,
+            updated=updated,
+            skipped=skipped,
+            failed=failed,
+            requests_used=processed,
+            request_budget_remaining=max(0, remaining_budget - processed),
+        )
+
+    async def _reserve_api_requests(
+        self,
+        *,
+        provider: str,
+        usage_date: date,
+        requests: int,
+        daily_limit: int,
+    ) -> bool:
+        statement = pg_insert(MarketDataAPIUsage).values(
+            provider=provider,
+            usage_date=usage_date,
+            requests_used=requests,
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=["provider", "usage_date"],
+            set_={
+                "requests_used": MarketDataAPIUsage.requests_used + requests,
+            },
+            where=MarketDataAPIUsage.requests_used + requests <= daily_limit,
+        ).returning(MarketDataAPIUsage.requests_used)
+        result = await self.db.execute(statement)
+        reserved = result.scalar_one_or_none() is not None
+        await self.db.commit()
+        return reserved
+
+    async def _release_api_requests(
+        self,
+        *,
+        provider: str,
+        usage_date: date,
+        requests: int,
+    ) -> None:
+        await self.db.execute(
+            MarketDataAPIUsage.__table__.update()
+            .where(
+                MarketDataAPIUsage.provider == provider,
+                MarketDataAPIUsage.usage_date == usage_date,
+            )
+            .values(
+                requests_used=func.greatest(
+                    0,
+                    MarketDataAPIUsage.requests_used - requests,
+                )
+            )
+        )
+        await self.db.commit()
+
+    async def _persist_stock_fundamentals(
+        self,
+        asset_id: UUID,
+        data: StockFundamentalData,
+    ) -> tuple[int, int]:
+        stock_result = await self.db.execute(
+            select(Stock).where(Stock.asset_id == asset_id)
+        )
+        stock = stock_result.scalar_one()
+        for field in (
+            "market_cap",
+            "pe_ratio",
+            "eps",
+            "dividend_yield",
+            "book_value",
+            "debt_to_equity",
+            "roe",
+        ):
+            value = getattr(data, field)
+            if value is not None:
+                setattr(stock, field, value)
+
+        period_dates = [period.period_end for period in data.periods]
+        existing_result = await self.db.execute(
+            select(FinancialMetric).where(
+                FinancialMetric.asset_id == asset_id,
+                FinancialMetric.period_type == "annual",
+                FinancialMetric.period_end.in_(period_dates),
+            )
+        ) if period_dates else None
+        existing = (
+            {
+                (metric.period_end, metric.consolidation_type): metric
+                for metric in existing_result.scalars()
+            }
+            if existing_result is not None
+            else {}
+        )
+
+        inserted = updated = 0
+        used_metric_ids = set()
+        for period in data.periods:
+            metric = existing.get(
+                (period.period_end, period.consolidation_type)
+            )
+            if (
+                metric is None
+                and period.consolidation_type is not None
+            ):
+                legacy_metric = existing.get((period.period_end, None))
+                if (
+                    legacy_metric is not None
+                    and legacy_metric.id not in used_metric_ids
+                ):
+                    metric = legacy_metric
+            is_new = metric is None
+            if metric is None:
+                metric = FinancialMetric(
+                    asset_id=asset_id,
+                    period_type="annual",
+                    period_end=period.period_end,
+                )
+            if metric.id is not None:
+                used_metric_ids.add(metric.id)
+            existing[(period.period_end, period.consolidation_type)] = metric
+            metric.consolidation_type = period.consolidation_type
+            metric.source_provider = (
+                data.source_provider
+                or self.settings.market_data_fundamentals_provider
+            )
+            metric.source_as_of_date = data.source_as_of_date
+            self._apply_financial_period(metric, period)
+            if is_new:
+                self.db.add(metric)
+                inserted += 1
+            else:
+                updated += 1
+        await self.db.commit()
+        return inserted, updated
+
+    @staticmethod
+    def _apply_financial_period(
+        metric: FinancialMetric,
+        period: FinancialPeriod,
+    ) -> None:
+        for field in (
+            "revenue",
+            "operating_profit",
+            "net_profit",
+            "eps",
+            "total_debt",
+            "shareholder_equity",
+            "cash",
+            "roe",
+            "roce",
+        ):
+            value = getattr(period, field)
+            if value is not None:
+                setattr(metric, field, value)
+
+    async def _record_asset_fundamentals_sync(
+        self,
+        asset_id: UUID,
+        *,
+        status: str,
+        error_category: str | None,
+        provider: str,
+        data: StockFundamentalData | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        statement = pg_insert(AssetFundamentalSyncState).values(
+            asset_id=asset_id,
+            status=status,
+            provider=provider,
+            last_attempted_at=now,
+            last_success_at=now if status == "success" else None,
+            source_as_of_date=data.source_as_of_date if data else None,
+            missing_fields=(
+                json.dumps(data.missing_fields)
+                if data and data.missing_fields
+                else None
+            ),
+            error_category=error_category,
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=["asset_id"],
+            set_={
+                "status": statement.excluded.status,
+                "provider": statement.excluded.provider,
+                "last_attempted_at": statement.excluded.last_attempted_at,
+                "last_success_at": func.coalesce(
+                    statement.excluded.last_success_at,
+                    AssetFundamentalSyncState.last_success_at,
+                ),
+                "source_as_of_date": statement.excluded.source_as_of_date,
+                "missing_fields": statement.excluded.missing_fields,
+                "error_category": statement.excluded.error_category,
+            },
+        )
+        await self.db.execute(statement)
+        await self.db.commit()
 
     async def _upsert_stock_catalog(
         self,
@@ -613,6 +1028,18 @@ class MarketDataSyncService:
     ) -> tuple[int, int, int]:
         if not records:
             return 0, 0, 0
+        unique_records: dict[str, IPORecord] = {}
+        for record in records:
+            previous = unique_records.get(record.ipo_id)
+            if previous is None:
+                unique_records[record.ipo_id] = record
+                continue
+            merged = record.model_dump()
+            for field, value in previous.model_dump().items():
+                if merged[field] is None:
+                    merged[field] = value
+            unique_records[record.ipo_id] = IPORecord.model_validate(merged)
+        records = list(unique_records.values())
         external_ids = [record.ipo_id for record in records]
         identity_result = await self.db.execute(
             select(AssetIdentifier).where(

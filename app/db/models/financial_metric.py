@@ -2,7 +2,16 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, func
+from sqlalchemy import (
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -11,6 +20,17 @@ from app.db.base import Base
 
 class FinancialMetric(Base):
     __tablename__ = "financial_metrics"
+    __table_args__ = (
+        Index(
+            "uq_financial_metric_source_period",
+            "asset_id",
+            "period_type",
+            "period_end",
+            "consolidation_type",
+            unique=True,
+            postgresql_where=text("consolidation_type IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -34,6 +54,26 @@ class FinancialMetric(Base):
         Date,
         nullable=False,
         index=True,
+    )
+
+    consolidation_type: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+    )
+
+    source_provider: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+
+    source_as_of_date: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+    )
+
+    shareholder_equity: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 2),
+        nullable=True,
     )
 
     revenue: Mapped[Decimal | None] = mapped_column(

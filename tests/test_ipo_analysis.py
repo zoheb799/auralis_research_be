@@ -6,6 +6,7 @@ from app.analysis.ipo_analysis import (
     analyze_ipo_risk,
     analyze_ipo,
 )
+from app.services.analysis_service import analyze_ipo_data
 
 def test_analyze_ipo_growth():
     result = analyze_ipo_growth(
@@ -153,3 +154,19 @@ def test_analyze_ipo():
 
     assert result["risk"]["debt"] == "moderate"
     assert result["risk"]["signal"] == "moderate"
+
+
+def test_analyze_ipo_data_ignores_repository_model_objects():
+    result = analyze_ipo_data(
+        {
+            "asset": object(),
+            "ipo": object(),
+            "issue_price_low": 100.0,
+            "issue_price_high": 110.0,
+            "lot_size": 10,
+            "issue_size": 500.0,
+        }
+    )
+
+    assert result.issue_structure.issue_price_low == 100.0
+    assert result.issue_structure.issue_size == 500.0

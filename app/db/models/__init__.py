@@ -10,6 +10,8 @@ from app.db.models.stock import Stock
 from app.db.models.asset_price import AssetPrice
 from app.db.models.market_data_sync_state import MarketDataSyncState
 from app.db.models.financial_metric import FinancialMetric
+from app.db.models.asset_fundamental_sync_state import AssetFundamentalSyncState
+from app.db.models.market_data_api_usage import MarketDataAPIUsage
 from app.db.models.portfolio import Portfolio
 from app.db.models.transaction import Transaction
 from app.db.models.holding import Holding
@@ -26,6 +28,8 @@ __all__ = [
     "AssetPrice",
     "MarketDataSyncState",
     "FinancialMetric",
+    "AssetFundamentalSyncState",
+    "MarketDataAPIUsage",
     "Portfolio",
     "Transaction",
     "Holding",

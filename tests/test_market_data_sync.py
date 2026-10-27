@@ -10,14 +10,22 @@ from app.core.config import Settings, settings
 from app.db.models.asset import Asset
 from app.db.models.asset_identifier import AssetIdentifier
 from app.db.models.asset_price import AssetPrice
+from app.db.models.financial_metric import FinancialMetric
 from app.db.models.ipo import IPO
 from app.db.models.stock import Stock
 from app.integrations.market_data.errors import (
     ProviderConfigurationError,
+    ProviderInstrumentNotFoundError,
     ProviderRateLimitError,
     ProviderResponseError,
 )
 from app.integrations.market_data.http import RetryingProviderClient
+from app.integrations.market_data.providers.alpha_vantage import (
+    AlphaVantageFundamentalsProvider,
+)
+from app.integrations.market_data.providers.bharatstock import (
+    BharatStockFundamentalsProvider,
+)
 from app.integrations.market_data.providers.mfapi import MFAPIProvider
 from app.integrations.market_data.providers.nse import (
     NSE_EQUITY_CSV_URL,
@@ -27,9 +35,11 @@ from app.integrations.market_data.providers.tejhq import TejHQProvider
 from app.integrations.market_data.providers.xflot import XflotProvider
 from app.integrations.market_data.registry import MarketDataProviderRegistry
 from app.integrations.market_data.schemas import (
+    FinancialPeriod,
     IPORecord,
     PriceObservation,
     StockCatalogSyncSummary,
+    StockFundamentalData,
     StockInstrument,
 )
 from app.main import app
@@ -356,8 +366,9 @@ async def test_stock_discovery_imports_catalog_before_fetching_prices():
         def stocks(self):
             return FakeStockProvider()
 
+    db = FakeSession()
     service = MarketDataSyncService(
-        FakeSession(),
+        db,
         build_settings(),
         FakeRegistry(),
     )
@@ -436,6 +447,400 @@ async def test_stock_catalog_sync_links_all_in_bounded_batches():
 
     assert discovery_calls == 4
     assert summary.identifiers_linked == 1023
+
+
+@pytest.mark.asyncio
+async def test_alpha_vantage_fundamentals_normalize_annual_statements():
+    client = FakeHTTPClient(
+        [
+            response(
+                200,
+                json_data={
+                    "Symbol": "EXAMPLE.BSE",
+                    "MarketCapitalization": "1000000",
+                    "PERatio": "18.5",
+                    "EPS": "12.5",
+                    "DividendYield": "0.02",
+                    "BookValue": "40",
+                    "ReturnOnEquityTTM": "0.15",
+                },
+            ),
+            response(
+                200,
+                json_data={
+                    "annualReports": [
+                        {
+                            "fiscalDateEnding": "2025-03-31",
+                            "totalRevenue": "10000",
+                            "operatingIncome": "1500",
+                            "netIncome": "1000",
+                            "reportedEPS": "12.5",
+                        }
+                    ]
+                },
+            ),
+            response(
+                200,
+                json_data={
+                    "annualReports": [
+                        {
+                            "fiscalDateEnding": "2025-03-31",
+                            "totalDebt": "2000",
+                            "totalShareholderEquity": "8000",
+                            "cashAndCashEquivalentsAtCarryingValue": "500",
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+    provider = AlphaVantageFundamentalsProvider(
+        build_settings(alpha_vantage_api_key="test-key"),
+        client,
+    )
+
+    data = await provider.fetch_fundamentals("EXAMPLE", "NSE")
+
+    assert data.provider_symbol == "EXAMPLE.BSE"
+    assert data.market_cap == Decimal("1000000")
+    assert data.pe_ratio == Decimal("18.5")
+    assert data.dividend_yield == Decimal("2.00")
+    assert data.roe == Decimal("15.00")
+    assert data.debt_to_equity == Decimal("0.25")
+    assert data.periods[0].period_end == date(2025, 3, 31)
+    assert data.periods[0].revenue == Decimal("10000")
+    assert data.periods[0].roe == Decimal("12.500")
+    assert data.periods[0].roce == Decimal(1500) / Decimal(9500) * 100
+    assert provider.requests_made == 3
+    assert [call[1]["function"] for call in client.calls] == [
+        "OVERVIEW",
+        "INCOME_STATEMENT",
+        "BALANCE_SHEET",
+    ]
+    assert all(call[1]["apikey"] == "test-key" for call in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_alpha_vantage_requires_key_and_surfaces_unsupported_symbols():
+    no_key_provider = AlphaVantageFundamentalsProvider(
+        build_settings(alpha_vantage_api_key=None),
+        FakeHTTPClient([]),
+    )
+    with pytest.raises(ProviderConfigurationError, match="ALPHA_VANTAGE_API_KEY"):
+        await no_key_provider.fetch_fundamentals("EXAMPLE", "NSE")
+
+    unsupported_provider = AlphaVantageFundamentalsProvider(
+        build_settings(alpha_vantage_api_key="test-key"),
+        FakeHTTPClient(
+            [
+                response(
+                    200,
+                    json_data={"Error Message": "Invalid API call"},
+                )
+            ]
+        ),
+    )
+    with pytest.raises(
+        ProviderInstrumentNotFoundError,
+        match="does not recognize",
+    ):
+        await unsupported_provider.fetch_fundamentals("EXAMPLE", "NSE")
+    assert unsupported_provider.requests_made == 1
+
+
+@pytest.mark.asyncio
+async def test_alpha_vantage_rate_limit_is_not_treated_as_empty_fundamentals():
+    provider = AlphaVantageFundamentalsProvider(
+        build_settings(alpha_vantage_api_key="test-key"),
+        FakeHTTPClient(
+            [response(200, json_data={"Note": "API call frequency exceeded"})]
+        ),
+    )
+
+    with pytest.raises(ProviderRateLimitError):
+        await provider.fetch_fundamentals("EXAMPLE", "NSE")
+    assert provider.requests_made == 1
+
+
+@pytest.mark.asyncio
+async def test_bharatstock_maps_verified_ratio_and_annual_statement_fields():
+    client = FakeHTTPClient(
+        [
+            response(
+                200,
+                json_data={
+                    "symbol": "EXAMPLE",
+                    "exchange": "NSE",
+                    "metrics": {
+                        "price": 200,
+                        "shares_outstanding": 5_000_000,
+                        "pe_ratio": 18.5,
+                        "eps": 12.5,
+                        "dividend_yield": 2,
+                        "book_value_per_share": 40,
+                        "debt_to_equity": 0.25,
+                        "roe": 15,
+                        "computed_at": "2026-10-28",
+                    },
+                    "latest_price": {"close": 199, "trade_date": "2026-10-27"},
+                },
+            ),
+            response(
+                200,
+                json_data={
+                    "items": [
+                        {
+                            "period_end_date": "2025-03-31",
+                            "consolidation_type": "consolidated",
+                            "revenue": 10000,
+                            "operating_profit": 1500,
+                            "net_profit": 1000,
+                            "eps": 12.5,
+                            "borrowings_current": 500,
+                            "borrowings_non_current": 1500,
+                            "total_equity": 8000,
+                            "cash_and_cash_equivalents": 500,
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+    provider = BharatStockFundamentalsProvider(
+        build_settings(bharatstock_api_key="test-key"),
+        client,
+    )
+
+    data = await provider.fetch_fundamentals("example", "NSE")
+
+    assert data.provider_symbol == "EXAMPLE"
+    assert data.source_provider == "bharatstock"
+    assert data.source_as_of_date == date(2026, 10, 28)
+    assert data.market_cap == Decimal("100")
+    assert data.pe_ratio == Decimal("18.5")
+    assert data.eps == Decimal("12.5")
+    assert data.dividend_yield == Decimal("2")
+    assert data.book_value == Decimal("40")
+    assert data.debt_to_equity == Decimal("0.25")
+    assert data.roe == Decimal("15")
+    assert data.missing_fields == []
+    assert data.periods[0].total_debt == Decimal("2000")
+    assert data.periods[0].shareholder_equity == Decimal("8000")
+    assert data.periods[0].consolidation_type == "consolidated"
+    assert provider.requests_made == 2
+    assert client.calls[0][2] == {"X-API-Key": "test-key"}
+    assert client.calls[0][1] == {"exchange": "NSE"}
+    assert client.calls[1][1]["period_type"] == "annual"
+
+
+@pytest.mark.asyncio
+async def test_bharatstock_keeps_ratio_data_when_annual_financials_are_missing():
+    client = FakeHTTPClient(
+        [
+            response(
+                200,
+                json_data={
+                    "symbol": "EXAMPLE",
+                    "exchange": "NSE",
+                    "metrics": {"pe_ratio": 12, "computed_at": "2026-10-28"}
+                },
+            ),
+            response(404, json_data={"detail": "No financials"}),
+        ]
+    )
+    provider = BharatStockFundamentalsProvider(
+        build_settings(bharatstock_api_key="test-key"),
+        client,
+    )
+
+    data = await provider.fetch_fundamentals("EXAMPLE", "BSE")
+
+    assert data.pe_ratio == Decimal("12")
+    assert data.periods == []
+    assert data.missing_fields == [
+        "market_cap",
+        "eps",
+        "dividend_yield",
+        "book_value",
+        "debt_to_equity",
+        "roe",
+        "annual_financial_periods",
+    ]
+    assert provider.requests_made == 2
+
+
+@pytest.mark.asyncio
+async def test_bharatstock_requires_key_and_surfaces_quota_exhaustion():
+    no_key_provider = BharatStockFundamentalsProvider(
+        build_settings(bharatstock_api_key=None),
+        FakeHTTPClient([]),
+    )
+    with pytest.raises(ProviderConfigurationError, match="BHARATSTOCK_API_KEY"):
+        await no_key_provider.fetch_fundamentals("EXAMPLE", "NSE")
+
+    rate_limited_provider = BharatStockFundamentalsProvider(
+        build_settings(bharatstock_api_key="test-key"),
+        FakeHTTPClient(
+            [
+                response(
+                    429,
+                    json_data={"detail": "quota reached"},
+                    headers={"Retry-After": "86400"},
+                )
+            ]
+        ),
+    )
+    with pytest.raises(
+        ProviderRateLimitError,
+        match="request quota",
+    ):
+        await rate_limited_provider.fetch_fundamentals("EXAMPLE", "NSE")
+
+
+@pytest.mark.asyncio
+async def test_fundamentals_dry_run_applies_symbol_filters_without_writing():
+    class FakeResult:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+        def all(self):
+            return self.value
+
+    class FakeSession:
+        def __init__(self):
+            self.statements = []
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            if len(self.statements) == 1:
+                return FakeResult(0)
+            return FakeResult([(uuid4(), "RELIANCE", "NSE")])
+
+    class FakeProvider:
+        provider_name = "bharatstock"
+        requests_per_stock = 2
+        requests_made = 0
+
+    class FakeRegistry:
+        def stock_fundamentals(self):
+            return FakeProvider()
+
+    db = FakeSession()
+    service = MarketDataSyncService(
+        db,
+        build_settings(
+            market_data_fundamentals_provider="bharatstock",
+            bharatstock_api_key=None,
+        ),
+        FakeRegistry(),
+    )
+
+    summary = await service.sync_stock_fundamentals(
+        dry_run=True,
+        limit=1,
+        symbol="reliance",
+        exchange="nse",
+    )
+
+    assert summary.discovered == 1
+    assert summary.requests_used == 0
+    assert summary.request_budget_remaining == 60
+    assert len(db.statements) == 2
+    compiled_query = str(db.statements[1])
+    assert "upper(assets.symbol)" in compiled_query
+    assert "upper(assets.exchange)" in compiled_query
+
+
+@pytest.mark.asyncio
+async def test_fundamental_persistence_updates_stock_and_annual_history():
+    asset_id = uuid4()
+    stock = Stock(asset_id=asset_id, pe_ratio=Decimal("99"))
+
+    class FakeResult:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one(self):
+            return self.value
+
+        def scalars(self):
+            return iter(self.value)
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+            self.added = []
+
+        async def execute(self, statement):
+            self.calls += 1
+            if self.calls in (1, 3):
+                return FakeResult(stock)
+            return FakeResult([])
+
+        def add(self, item):
+            self.added.append(item)
+
+        async def commit(self):
+            pass
+
+    db = FakeSession()
+    service = MarketDataSyncService(
+        db,
+        build_settings(),
+        MarketDataProviderRegistry(build_settings(), FakeHTTPClient([])),
+    )
+    inserted, updated = await service._persist_stock_fundamentals(
+        asset_id,
+        StockFundamentalData(
+            provider_symbol="EXAMPLE.BSE",
+            source_provider="bharatstock",
+            source_as_of_date=date(2026, 10, 28),
+            market_cap=Decimal("1000000"),
+            pe_ratio=Decimal("18.5"),
+            eps=Decimal("12.5"),
+            dividend_yield=Decimal("2"),
+            book_value=Decimal("40"),
+            debt_to_equity=Decimal("0.25"),
+            roe=Decimal("15"),
+            periods=[
+                FinancialPeriod(
+                    period_end=date(2025, 3, 31),
+                    consolidation_type="consolidated",
+                    revenue=Decimal("10000"),
+                    operating_profit=Decimal("1500"),
+                    net_profit=Decimal("1000"),
+                    eps=Decimal("12.5"),
+                    total_debt=Decimal("2000"),
+                    cash=Decimal("500"),
+                    roe=Decimal("12.5"),
+                    roce=Decimal("15.79"),
+                )
+            ],
+        ),
+    )
+
+    assert (inserted, updated) == (1, 0)
+    assert stock.market_cap == Decimal("1000000")
+    assert stock.pe_ratio == Decimal("18.5")
+    assert stock.roe == Decimal("15")
+    metrics = [item for item in db.added if isinstance(item, FinancialMetric)]
+    assert len(metrics) == 1
+    assert metrics[0].period_type == "annual"
+    assert metrics[0].consolidation_type == "consolidated"
+    assert metrics[0].source_provider == "bharatstock"
+    assert metrics[0].source_as_of_date == date(2026, 10, 28)
+    assert metrics[0].revenue == Decimal("10000")
+    assert metrics[0].roce == Decimal("15.79")
+
+    await service._persist_stock_fundamentals(
+        asset_id,
+        StockFundamentalData(provider_symbol="EXAMPLE.BSE"),
+    )
+    assert stock.pe_ratio == Decimal("18.5")
+    assert stock.market_cap == Decimal("1000000")
 
 
 @pytest.mark.asyncio
@@ -716,6 +1121,59 @@ async def test_ipo_status_updates_without_clearing_unavailable_fields():
     assert existing.issue_price_low == Decimal("100")
     assert existing.listing_date == date(2026, 10, 30)
     assert existing.source_disclaimer == record.source_disclaimer
+
+
+@pytest.mark.asyncio
+async def test_ipo_persistence_merges_duplicate_provider_ids():
+    class FakeSession:
+        async def execute(self, statement):
+            class Result:
+                def scalars(self):
+                    return iter([])
+
+            return Result()
+
+        def add_all(self, values):
+            self.values = values
+
+        async def commit(self):
+            pass
+
+    service = MarketDataSyncService(
+        FakeSession(),
+        build_settings(),
+        MarketDataProviderRegistry(build_settings(), FakeHTTPClient([])),
+    )
+    first = IPORecord(
+        ipo_id="duplicate-ipo",
+        name="Duplicate IPO",
+        status="open",
+        issue_price_low=Decimal("100"),
+    )
+    duplicate = IPORecord(
+        ipo_id="duplicate-ipo",
+        name="Duplicate IPO",
+        status="listed",
+        issue_price_high=Decimal("110"),
+    )
+
+    inserted, updated, skipped = await service._persist_ipos(
+        [first, duplicate],
+        provider_name="xflot",
+    )
+
+    new_identities = [
+        item
+        for item in service.db.values
+        if isinstance(item, AssetIdentifier)
+    ]
+    new_ipos = [item for item in service.db.values if isinstance(item, IPO)]
+    assert (inserted, updated, skipped) == (1, 0, 0)
+    assert len(new_identities) == 1
+    assert len(new_ipos) == 1
+    assert new_ipos[0].ipo_status == "listed"
+    assert new_ipos[0].issue_price_low == Decimal("100")
+    assert new_ipos[0].issue_price_high == Decimal("110")
 
 
 @pytest.mark.asyncio

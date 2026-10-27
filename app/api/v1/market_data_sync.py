@@ -161,6 +161,7 @@ def _provider_for_job(job: str) -> str:
         "stocks": settings.market_data_stock_provider,
         "mutual-funds": settings.market_data_mutual_fund_provider,
         "ipos": settings.market_data_ipo_provider,
+        "fundamentals": settings.market_data_fundamentals_provider,
     }[job]
 
 
@@ -253,6 +254,29 @@ async def sync_ipos(
     return await run_locked("ipos", service.sync_ipos, service)
 
 
+@router.post("/fundamentals", response_model=SyncSummary)
+async def sync_stock_fundamentals(
+    limit: int | None = Query(default=None, ge=1),
+    symbol: str | None = Query(default=None, min_length=1),
+    exchange: str | None = Query(default=None, pattern="(?i)^(NSE|BSE)$"),
+    retry_failed: bool = False,
+    force_refresh: bool = False,
+    service: MarketDataSyncService = Depends(get_sync_service),
+    _: None = Depends(authenticate_cron),
+) -> SyncSummary:
+    return await run_locked(
+        "fundamentals",
+        lambda: service.sync_stock_fundamentals(
+            limit=limit,
+            symbol=symbol,
+            exchange=exchange,
+            retry_failed=retry_failed,
+            force_refresh=force_refresh,
+        ),
+        service,
+    )
+
+
 @router.post("/all")
 async def sync_all(
     discover: bool = True,
@@ -271,6 +295,7 @@ async def sync_all(
             ),
         ),
         ("ipos", service.sync_ipos),
+        ("fundamentals", service.sync_stock_fundamentals),
     )
     for job, operation in operations:
         try:

@@ -30,3 +30,17 @@ def test_quality_with_missing_data():
     assert result["growth"] == "unknown"
     assert result["consistency"] == "unknown"
     assert result["signal"] == "unknown"
+
+
+def test_quality_scores_stable_growth_without_crashing():
+    result = analyze_quality(profit_growth=4.0)
+
+    assert result["growth"] == "stable"
+    assert result["signal"] == "moderate"
+
+
+def test_quality_scores_negative_growth_without_crashing():
+    result = analyze_quality(profit_growth=-4.0)
+
+    assert result["growth"] == "negative"
+    assert result["signal"] == "weak"

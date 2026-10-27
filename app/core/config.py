@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     tejhq_api_base_url: str = "https://api.tejhq.dev"
     xflot_api_base_url: str = "https://www.xflot.com"
     mfapi_base_url: str = "https://api.mfapi.in"
+    alpha_vantage_api_key: str | None = None
+    alpha_vantage_base_url: str = "https://www.alphavantage.co/query"
+    alpha_vantage_exchange_suffix: str = ".BSE"
+    alpha_vantage_daily_request_limit: int = 25
+    market_data_fundamentals_provider: str = "bharatstock"
+    bharatstock_api_key: str | None = None
+    bharatstock_base_url: str = "https://bharatstockapi.com"
+    bharatstock_daily_request_limit: int = 60
     upstox_access_token: str | None = None
     market_data_stock_instrument_keys: str = ""
 

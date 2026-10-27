@@ -245,7 +245,12 @@ def analyze_ipo_data(
     a validated response.
     """
 
-    result = analyze_ipo(**data)
+    analysis_data = {
+        key: value
+        for key, value in data.items()
+        if key not in {"asset", "ipo"}
+    }
+    result = analyze_ipo(**analysis_data)
 
     return IPOAnalysisResponse.model_validate(
         result
@@ -273,7 +278,12 @@ def analyze_mutual_fund_data(
     a validated response.
     """
 
-    result = analyze_mutual_fund(**data)
+    analysis_data = {
+        key: value
+        for key, value in data.items()
+        if key not in {"asset", "fund"}
+    }
+    result = analyze_mutual_fund(**analysis_data)
 
     return MutualFundAnalysisResponse.model_validate(
         result

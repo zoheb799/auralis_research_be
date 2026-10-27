@@ -39,6 +39,9 @@ def analyze_quality(
         "healthy": 2,
         "moderate": 1,
         "weak": 0,
+        "positive": 2,
+        "stable": 1,
+        "negative": 0,
         "unknown": None,
     }
 

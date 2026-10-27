@@ -18,3 +18,7 @@ class ProviderRateLimitError(ProviderRequestError):
 
 class ProviderResponseError(MarketDataError):
     pass
+
+
+class ProviderInstrumentNotFoundError(ProviderResponseError):
+    pass
