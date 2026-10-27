@@ -8,6 +8,9 @@ from app.integrations.market_data.base import (
     StockDataProvider,
 )
 from app.integrations.market_data.providers.mfapi import MFAPIProvider
+from app.integrations.market_data.providers.nse import (
+    NSEEquityCatalogProvider,
+)
 from app.integrations.market_data.providers.tejhq import TejHQProvider
 from app.integrations.market_data.providers.xflot import XflotProvider
 
@@ -23,6 +26,9 @@ class MarketDataProviderRegistry:
                 "Unsupported stock provider; configured provider must implement stocks"
             )
         return TejHQProvider(self.settings, self.http_client)
+
+    def stock_catalog(self) -> NSEEquityCatalogProvider:
+        return NSEEquityCatalogProvider(self.http_client)
 
     def ipos(self) -> IPODataProvider:
         if self.settings.market_data_ipo_provider.lower() != "xflot":

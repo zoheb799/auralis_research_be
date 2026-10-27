@@ -35,7 +35,7 @@ class TejHQProvider:
             symbol = symbol.upper().strip()
             if not separator or exchange not in {"NSE", "BSE"} or not symbol:
                 raise ProviderConfigurationError(
-                    "MARKET_DATA_STOCK_SYMBOLS entries must use EXCHANGE:SYMBOL"
+                    "Stock discovery entries must use EXCHANGE:SYMBOL"
                 )
             instruments.append(
                 StockInstrument(
@@ -47,7 +47,7 @@ class TejHQProvider:
             )
         if not instruments:
             raise ProviderConfigurationError(
-                "Set MARKET_DATA_STOCK_SYMBOLS to a comma-separated exchange:symbol allowlist"
+                "No stock symbols were provided for discovery"
             )
         return instruments
 

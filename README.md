@@ -34,7 +34,7 @@ Copy the market-data settings from `.env.example` into the project-root `.env`. 
 
 Set `MARKET_DATA_SYNC_ENABLED=true` only after confirming provider terms and applying the migration. Keep real secrets out of source control.
 
-The active stock catalog is the TejHQ allowlist. Discovery selects active `Asset` rows with a matching `Stock` record, a symbol, and an NSE/BSE exchange, bounded by `MARKET_DATA_STOCK_SYNC_LIMIT`. Add or deactivate catalog records to control which stocks are synced; the service does not import the whole exchange. TejHQ's per-symbol OHLCV response does not provide enough company metadata to create an unknown asset safely. Provider identity is stored as provider + exchange scope + symbol, without replacing the internal UUID. The old `MARKET_DATA_STOCK_SYMBOLS` setting is ignored and may be removed from local `.env` files when convenient.
+The stock catalog is imported from the NSE equity master CSV during `POST /api/v1/internal/market-data/sync/stocks?discover=true` or `POST /api/v1/internal/market-data/sync/all`. Import adds or refreshes all current NSE `EQ`-series assets and ensures each has a `stocks` row, then links TejHQ identifiers in bounded batches. `MARKET_DATA_STOCK_SYNC_LIMIT` bounds each discovery batch and the number of stocks whose prices are fetched per run. The same request then syncs prices for up to that many linked stocks. The import is additive and does not delete assets that are no longer in the NSE master. The NSE master does not provide sector data, so existing sectors are left unchanged and new assets' sectors are empty. This covers NSE `EQ`-series listings, not BSE or other NSE series; TejHQ may not return observations for every symbol. Provider identity is stored as provider + exchange scope + symbol, without replacing the internal UUID. The old `MARKET_DATA_STOCK_SYMBOLS` setting is ignored and may be removed from local `.env` files when convenient.
 
 ## Migration
 
@@ -48,10 +48,10 @@ The newest migration only adds nullable `source_attribution` and `source_disclai
 
 ## Discovery And Sync
 
-1. Ensure the curated stock assets exist and are active in `assets` with corresponding rows in `stocks`. Run `POST /api/v1/internal/market-data/sync/stocks?discover=true` to attach TejHQ identifiers, then run the same endpoint without `discover=true` for EOD updates.
+1. For a one-call bootstrap/refresh of all catalogs and their available data, run `POST /api/v1/internal/market-data/sync/all`. Discovery is enabled by default on this combined endpoint: it imports the NSE stock catalog, discovers a bounded page of MFAPI schemes, refreshes the Xflot IPO catalog, and syncs available stock prices and MF NAVs. The stock job response reports `catalog_assets_inserted`, `catalog_assets_updated`, and `catalog_stock_records_inserted`. `MARKET_DATA_MF_DISCOVERY_LIMIT` bounds fund discovery and `discovery_offset` can be used on `/sync/all` to discover later pages. Routine EOD updates can use `POST /api/v1/internal/market-data/sync/all?discover=false`.
 2. Run `POST /api/v1/internal/market-data/sync/mutual-funds?discover=true&discovery_offset=0` to import up to `MARKET_DATA_MF_DISCOVERY_LIMIT` schemes. Continue with the next offset for later pages.
 3. Run `POST /api/v1/internal/market-data/sync/ipos` to refresh the bounded Xflot IPO catalog.
-4. `POST /api/v1/internal/market-data/sync/all` runs all three sequentially. Discovery remains opt-in.
+4. `POST /api/v1/internal/market-data/sync/all` runs all three sequentially and discovers catalogs by default. Use `?discover=false` to sync only previously discovered stocks and funds.
 
 Price history upserts on asset, provider, observation type, interval, and provider trading timestamp; repeated EOD data updates the same daily observation rather than creating duplicates. MFAPI NAV history uses the same observation table with `observation_type=nav`, `interval=daily`. Network calls are bounded and occur before database writes. PostgreSQL advisory locks prevent overlapping jobs across workers; sync summaries and last success are retained in `market_data_sync_state`.
 

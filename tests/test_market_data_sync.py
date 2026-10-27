@@ -11,6 +11,7 @@ from app.db.models.asset import Asset
 from app.db.models.asset_identifier import AssetIdentifier
 from app.db.models.asset_price import AssetPrice
 from app.db.models.ipo import IPO
+from app.db.models.stock import Stock
 from app.integrations.market_data.errors import (
     ProviderConfigurationError,
     ProviderRateLimitError,
@@ -18,10 +19,19 @@ from app.integrations.market_data.errors import (
 )
 from app.integrations.market_data.http import RetryingProviderClient
 from app.integrations.market_data.providers.mfapi import MFAPIProvider
+from app.integrations.market_data.providers.nse import (
+    NSE_EQUITY_CSV_URL,
+    NSEEquityCatalogProvider,
+)
 from app.integrations.market_data.providers.tejhq import TejHQProvider
 from app.integrations.market_data.providers.xflot import XflotProvider
 from app.integrations.market_data.registry import MarketDataProviderRegistry
-from app.integrations.market_data.schemas import IPORecord, StockInstrument
+from app.integrations.market_data.schemas import (
+    IPORecord,
+    PriceObservation,
+    StockCatalogSyncSummary,
+    StockInstrument,
+)
 from app.main import app
 from app.services.market_data_sync import MarketDataSyncService
 
@@ -188,6 +198,244 @@ async def test_stock_discovery_uses_bounded_database_catalog_not_env_symbols():
         for item in service.db.added
         if isinstance(item, AssetIdentifier)
     } == {"RELIANCE", "TCS"}
+
+
+@pytest.mark.asyncio
+async def test_nse_catalog_parses_eq_equities_and_skips_other_series():
+    csv_content = (
+        "SYMBOL,NAME OF COMPANY, SERIES, DATE OF LISTING\n"
+        "EXAMPLE,Example Limited,EQ,01-JAN-2020\n"
+        "EXAMPLESME,Example SME Limited,BE,01-JAN-2020\n"
+    )
+    client = FakeHTTPClient(
+        [
+            httpx.Response(
+                200,
+                content=csv_content.encode(),
+                request=httpx.Request("GET", NSE_EQUITY_CSV_URL),
+            )
+        ]
+    )
+    provider = NSEEquityCatalogProvider(client)
+
+    instruments = await provider.fetch_constituents()
+
+    assert len(instruments) == 1
+    assert instruments[0].instrument_key == "NSE:EXAMPLE"
+    assert instruments[0].name == "Example Limited"
+    assert instruments[0].sector is None
+    assert client.calls[0][0] == NSE_EQUITY_CSV_URL
+
+
+@pytest.mark.asyncio
+async def test_nse_catalog_rejects_duplicate_symbols():
+    csv_content = (
+        "SYMBOL,NAME OF COMPANY,SERIES\n"
+        "EXAMPLE,Example Limited,EQ\n"
+        "EXAMPLE,Duplicate Example,EQ\n"
+    )
+    client = FakeHTTPClient(
+        [
+            httpx.Response(
+                200,
+                content=csv_content.encode(),
+                request=httpx.Request("GET", NSE_EQUITY_CSV_URL),
+            )
+        ]
+    )
+    provider = NSEEquityCatalogProvider(client)
+
+    with pytest.raises(ProviderResponseError, match="invalid or duplicate equity"):
+        await provider.fetch_constituents()
+
+
+@pytest.mark.asyncio
+async def test_stock_catalog_upsert_reactivates_existing_and_adds_missing_assets():
+    class FakeResult:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def scalars(self):
+            return iter(self.rows)
+
+    class FakeSession:
+        def __init__(self):
+            self.execute_count = 0
+            self.added = []
+
+        async def execute(self, statement):
+            self.execute_count += 1
+            if self.execute_count == 1:
+                return FakeResult([existing_asset])
+            if self.execute_count == 2:
+                return FakeResult([])
+            raise AssertionError("Unexpected database query")
+
+        def add_all(self, rows):
+            self.added.extend(rows)
+
+        async def commit(self):
+            pass
+
+    existing_asset = Asset(
+        id=uuid4(),
+        name="Old Name",
+        symbol="existing",
+        asset_type="stock",
+        exchange="nse",
+        sector="Old Sector",
+        is_active=False,
+    )
+    session = FakeSession()
+    service = MarketDataSyncService(
+        session,
+        build_settings(),
+        MarketDataProviderRegistry(build_settings(), FakeHTTPClient([])),
+    )
+
+    inserted, updated, stock_rows = await service._upsert_stock_catalog(
+        [
+            StockInstrument(
+                instrument_key="NSE:EXISTING",
+                symbol="EXISTING",
+                name="Updated Name",
+                exchange="NSE",
+                sector="Updated Sector",
+            ),
+            StockInstrument(
+                instrument_key="NSE:NEWCO",
+                symbol="NEWCO",
+                name="New Company",
+                exchange="NSE",
+                sector="Industrials",
+            ),
+        ]
+    )
+
+    assert (inserted, updated, stock_rows) == (1, 1, 2)
+    assert existing_asset.name == "Updated Name"
+    assert existing_asset.symbol == "EXISTING"
+    assert existing_asset.exchange == "NSE"
+    assert existing_asset.sector == "Updated Sector"
+    assert existing_asset.is_active is True
+    new_assets = [item for item in session.added if isinstance(item, Asset)]
+    new_stocks = [item for item in session.added if isinstance(item, Stock)]
+    assert [(item.symbol, item.exchange) for item in new_assets] == [("NEWCO", "NSE")]
+    assert len(new_stocks) == 2
+
+
+@pytest.mark.asyncio
+async def test_stock_discovery_imports_catalog_before_fetching_prices():
+    asset_id = uuid4()
+
+    class FakeResult:
+        def all(self):
+            return [(asset_id, "EXAMPLE", "NSE")]
+
+    class FakeSession:
+        async def execute(self, statement):
+            return FakeResult()
+
+        async def commit(self):
+            pass
+
+    class FakeStockProvider:
+        provider_name = "tejhq"
+
+        async def fetch_observations(self, instrument_keys):
+            assert instrument_keys == ["NSE:EXAMPLE"]
+            return [
+                PriceObservation(
+                    instrument_key="NSE:EXAMPLE",
+                    price=Decimal("10"),
+                    price_timestamp=datetime(2026, 10, 21, tzinfo=timezone.utc),
+                )
+            ]
+
+    class FakeRegistry:
+        def stocks(self):
+            return FakeStockProvider()
+
+    service = MarketDataSyncService(
+        FakeSession(),
+        build_settings(),
+        FakeRegistry(),
+    )
+    catalog_calls = 0
+
+    async def sync_catalog():
+        nonlocal catalog_calls
+        catalog_calls += 1
+        return StockCatalogSyncSummary(
+            source="nse",
+            fetched=100,
+            assets_inserted=80,
+            assets_updated=20,
+            stock_records_inserted=100,
+            identifiers_linked=1,
+        )
+
+    async def upsert_prices(rows):
+        assert len(rows) == 1
+        return 1, 0
+
+    service.sync_stock_catalog = sync_catalog
+    service._upsert_prices = upsert_prices
+
+    summary = await service.sync_stocks(discover=True)
+
+    assert catalog_calls == 1
+    assert summary.discovered == 1
+    assert summary.catalog_assets_inserted == 80
+    assert summary.catalog_assets_updated == 20
+    assert summary.catalog_stock_records_inserted == 100
+    assert summary.inserted == 1
+
+
+@pytest.mark.asyncio
+async def test_stock_catalog_sync_links_all_in_bounded_batches():
+    class FakeCatalogProvider:
+        provider_name = "nse"
+
+        async def fetch_constituents(self):
+            return []
+
+    class FakeStockProvider:
+        provider_name = "tejhq"
+
+    class FakeRegistry:
+        def stock_catalog(self):
+            return FakeCatalogProvider()
+
+        def stocks(self):
+            return FakeStockProvider()
+
+    class FakeSession:
+        pass
+
+    service = MarketDataSyncService(
+        FakeSession(),
+        build_settings(),
+        FakeRegistry(),
+    )
+    discovery_batches = iter([500, 500, 23, 0])
+    discovery_calls = 0
+
+    async def upsert_catalog(instruments):
+        return 0, 0, 0
+
+    async def discover_batch(provider):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return next(discovery_batches)
+
+    service._upsert_stock_catalog = upsert_catalog
+    service._discover_stocks = discover_batch
+
+    summary = await service.sync_stock_catalog()
+
+    assert discovery_calls == 4
+    assert summary.identifiers_linked == 1023
 
 
 @pytest.mark.asyncio
@@ -504,3 +752,16 @@ def test_internal_sync_requires_dedicated_cron_secret(monkeypatch):
 
     assert response_without_secret.status_code == 401
     assert response_with_wrong_secret.status_code == 401
+
+
+def test_combined_sync_discovers_catalogs_by_default():
+    operation = app.openapi()["paths"][
+        "/api/v1/internal/market-data/sync/all"
+    ]["post"]
+    discover_parameter = next(
+        parameter
+        for parameter in operation["parameters"]
+        if parameter["name"] == "discover"
+    )
+
+    assert discover_parameter["schema"]["default"] is True

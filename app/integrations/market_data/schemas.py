@@ -19,6 +19,15 @@ class StockInstrument(NormalizedRecord):
     sector: str | None = None
 
 
+class StockCatalogSyncSummary(NormalizedRecord):
+    source: str
+    fetched: int
+    assets_inserted: int
+    assets_updated: int
+    stock_records_inserted: int
+    identifiers_linked: int
+
+
 class PriceObservation(NormalizedRecord):
     instrument_key: str
     price: Decimal = Field(gt=0)
@@ -81,6 +90,9 @@ class SyncSummary(NormalizedRecord):
     job_id: str = Field(default_factory=lambda: str(uuid4()))
     duration_seconds: float = 0.0
     discovered: int = 0
+    catalog_assets_inserted: int = 0
+    catalog_assets_updated: int = 0
+    catalog_stock_records_inserted: int = 0
     inserted: int = 0
     updated: int = 0
     skipped: int = 0

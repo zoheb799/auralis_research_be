@@ -3,7 +3,7 @@ from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, text, tuple_
+from sqlalchemy import and_, select, text, tuple_
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +29,7 @@ from app.integrations.market_data.schemas import (
     IPORecord,
     NavObservation,
     PriceObservation,
+    StockCatalogSyncSummary,
     StockInstrument,
     SyncSummary,
 )
@@ -105,8 +106,17 @@ class MarketDataSyncService:
     async def sync_stocks(self, *, discover: bool = False) -> SyncSummary:
         provider = self.providers.stocks()
         discovered = 0
+        catalog_assets_inserted = 0
+        catalog_assets_updated = 0
+        catalog_stock_records_inserted = 0
         if discover:
-            discovered = await self._discover_stocks(provider)
+            catalog_summary = await self.sync_stock_catalog()
+            discovered = catalog_summary.identifiers_linked
+            catalog_assets_inserted = catalog_summary.assets_inserted
+            catalog_assets_updated = catalog_summary.assets_updated
+            catalog_stock_records_inserted = (
+                catalog_summary.stock_records_inserted
+            )
 
         identifiers = await self.db.execute(
             select(
@@ -127,7 +137,7 @@ class MarketDataSyncService:
         rows = identifiers.all()
         if not rows:
             raise ProviderConfigurationError(
-                "No linked stocks; run discovery with MARKET_DATA_STOCK_SYMBOLS"
+                "No linked stocks; run the stock catalog sync or stock discovery"
             )
 
         asset_by_key = {
@@ -166,10 +176,119 @@ class MarketDataSyncService:
             job="stocks",
             provider=provider.provider_name,
             discovered=discovered,
+            catalog_assets_inserted=catalog_assets_inserted,
+            catalog_assets_updated=catalog_assets_updated,
+            catalog_stock_records_inserted=catalog_stock_records_inserted,
             inserted=inserted,
             updated=updated,
             skipped=len(observations) - len(price_rows),
         )
+
+    async def sync_stock_catalog(self) -> StockCatalogSyncSummary:
+        catalog_provider = self.providers.stock_catalog()
+        instruments = await catalog_provider.fetch_constituents()
+        assets_inserted, assets_updated, stock_records_inserted = (
+            await self._upsert_stock_catalog(instruments)
+        )
+        identifiers_linked = 0
+        stock_provider = self.providers.stocks()
+        while True:
+            batch_linked = await self._discover_stocks(stock_provider)
+            identifiers_linked += batch_linked
+            if batch_linked == 0:
+                break
+        return StockCatalogSyncSummary(
+            source=catalog_provider.provider_name,
+            fetched=len(instruments),
+            assets_inserted=assets_inserted,
+            assets_updated=assets_updated,
+            stock_records_inserted=stock_records_inserted,
+            identifiers_linked=identifiers_linked,
+        )
+
+    async def _upsert_stock_catalog(
+        self,
+        instruments: list[StockInstrument],
+    ) -> tuple[int, int, int]:
+        catalog_keys = {
+            (instrument.exchange.upper(), instrument.symbol.upper())
+            for instrument in instruments
+        }
+        existing_result = await self.db.execute(
+            select(Asset).where(
+                Asset.asset_type == "stock",
+                tuple_(
+                    func.upper(Asset.exchange),
+                    func.upper(Asset.symbol),
+                ).in_(catalog_keys),
+            )
+        )
+        existing_assets: dict[tuple[str, str], Asset] = {}
+        for asset in existing_result.scalars():
+            key = ((asset.exchange or "").upper(), (asset.symbol or "").upper())
+            if key in existing_assets:
+                raise ProviderResponseError(
+                    f"Multiple stock assets exist for {key[0]}:{key[1]}"
+                )
+            existing_assets[key] = asset
+
+        new_assets: list[Asset] = []
+        stock_asset_ids: list[UUID] = []
+        assets_inserted = assets_updated = 0
+        for instrument in instruments:
+            key = (instrument.exchange.upper(), instrument.symbol.upper())
+            asset = existing_assets.get(key)
+            if asset is None:
+                asset = Asset(
+                    id=uuid4(),
+                    name=instrument.name or instrument.symbol,
+                    symbol=instrument.symbol,
+                    asset_type="stock",
+                    exchange=instrument.exchange,
+                    sector=instrument.sector,
+                    is_active=True,
+                )
+                new_assets.append(asset)
+                existing_assets[key] = asset
+                assets_inserted += 1
+                continue
+
+            if (
+                asset.name != instrument.name
+                or asset.symbol != instrument.symbol
+                or asset.exchange != instrument.exchange
+                or (
+                    instrument.sector is not None
+                    and asset.sector != instrument.sector
+                )
+                or not asset.is_active
+            ):
+                asset.name = instrument.name or instrument.symbol
+                asset.symbol = instrument.symbol
+                asset.exchange = instrument.exchange
+                if instrument.sector is not None:
+                    asset.sector = instrument.sector
+                asset.is_active = True
+                assets_updated += 1
+            stock_asset_ids.append(asset.id)
+
+        stock_ids: set[UUID] = set()
+        if stock_asset_ids:
+            stock_result = await self.db.execute(
+                select(Stock.asset_id).where(Stock.asset_id.in_(stock_asset_ids))
+            )
+            stock_ids = set(stock_result.scalars())
+
+        new_stocks = [
+            Stock(asset_id=asset_id)
+            for asset_id in stock_asset_ids
+            if asset_id not in stock_ids
+        ]
+        stock_records_inserted = len(new_stocks) + len(new_assets)
+        new_stocks.extend(Stock(asset_id=asset.id) for asset in new_assets)
+        self.db.add_all([*new_assets, *new_stocks])
+        await self.db.commit()
+        return assets_inserted, assets_updated, stock_records_inserted
 
     async def sync_mutual_funds(
         self,
@@ -264,11 +383,22 @@ class MarketDataSyncService:
         catalog_result = await self.db.execute(
             select(Asset.symbol, Asset.exchange)
             .join(Stock, Stock.asset_id == Asset.id)
+            .outerjoin(
+                AssetIdentifier,
+                and_(
+                    AssetIdentifier.provider == provider.provider_name,
+                    AssetIdentifier.identifier_type == "stock_symbol",
+                    func.upper(AssetIdentifier.scope) == func.upper(Asset.exchange),
+                    func.upper(AssetIdentifier.external_id)
+                    == func.upper(Asset.symbol),
+                ),
+            )
             .where(
                 Asset.asset_type == "stock",
                 Asset.is_active.is_(True),
                 Asset.symbol.is_not(None),
                 func.upper(Asset.exchange).in_(("NSE", "BSE")),
+                AssetIdentifier.id.is_(None),
             )
             .order_by(Asset.exchange, Asset.symbol)
             .limit(max(1, self.settings.market_data_stock_sync_limit))
@@ -279,9 +409,7 @@ class MarketDataSyncService:
             if symbol and exchange
         }
         if not configured_symbols:
-            raise ProviderConfigurationError(
-                "No active NSE/BSE stocks found in the asset catalog"
-            )
+            return 0
         instruments = provider.fetch_instruments(configured_symbols)
         if not instruments:
             raise ProviderResponseError(

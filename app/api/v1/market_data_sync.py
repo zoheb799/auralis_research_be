@@ -15,7 +15,10 @@ from app.core.config import settings
 from app.db.models.market_data_sync_state import MarketDataSyncState
 from app.integrations.market_data.errors import MarketDataError, ProviderRateLimitError
 from app.integrations.market_data.registry import MarketDataProviderRegistry
-from app.integrations.market_data.schemas import SyncSummary
+from app.integrations.market_data.schemas import (
+    StockCatalogSyncSummary,
+    SyncSummary,
+)
 from app.services.market_data_lock import market_data_job_lock
 from app.services.market_data_sync import MarketDataSyncService, SyncAlreadyRunning
 
@@ -174,6 +177,57 @@ async def sync_stocks(
     )
 
 
+@router.post("/stocks/catalog", response_model=StockCatalogSyncSummary)
+async def sync_stock_catalog(
+    service: MarketDataSyncService = Depends(get_sync_service),
+    _: None = Depends(authenticate_cron),
+) -> StockCatalogSyncSummary:
+    started = perf_counter()
+    try:
+        async with market_data_job_lock("stocks"):
+            result = await service.sync_stock_catalog()
+            logger.info(
+                "market_data_catalog_sync_complete source=%s fetched=%s assets_inserted=%s assets_updated=%s stock_records_inserted=%s identifiers_linked=%s duration_seconds=%.3f",
+                result.source,
+                result.fetched,
+                result.assets_inserted,
+                result.assets_updated,
+                result.stock_records_inserted,
+                result.identifiers_linked,
+                perf_counter() - started,
+            )
+            return result
+    except SyncAlreadyRunning as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except MarketDataError as exc:
+        await service.db.rollback()
+        logger.warning(
+            "market_data_catalog_sync_failed category=%s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+    except SQLAlchemyError as exc:
+        await service.db.rollback()
+        logger.exception("market_data_catalog_sync_failed category=database")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Stock catalog sync could not persist its result",
+        ) from exc
+    except Exception as exc:
+        await service.db.rollback()
+        logger.exception("market_data_catalog_sync_failed category=unexpected")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Stock catalog sync failed",
+        ) from exc
+
+
 @router.post("/mutual-funds", response_model=SyncSummary)
 async def sync_mutual_funds(
     discover: bool = False,
@@ -201,7 +255,7 @@ async def sync_ipos(
 
 @router.post("/all")
 async def sync_all(
-    discover: bool = False,
+    discover: bool = True,
     discovery_offset: int = Query(default=0, ge=0),
     service: MarketDataSyncService = Depends(get_sync_service),
     _: None = Depends(authenticate_cron),
