@@ -68,7 +68,11 @@ class MarketDataSyncService:
         started_at: datetime,
         error_category: str | None = None,
     ) -> None:
-        finished_at = datetime.now(timezone.utc)
+        finished_at = (
+            datetime.now(timezone.utc)
+            if status != "running"
+            else None
+        )
         state = MarketDataSyncState.__table__
         statement = pg_insert(MarketDataSyncState).values(
             id=uuid4(),

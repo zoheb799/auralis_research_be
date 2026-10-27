@@ -1223,3 +1223,48 @@ def test_combined_sync_discovers_catalogs_by_default():
     )
 
     assert discover_parameter["schema"]["default"] is True
+
+
+def test_combined_sync_returns_accepted_and_schedules_background_work(monkeypatch):
+    import app.api.v1.market_data_sync as sync_api
+    from app.api.v1.market_data_sync import get_sync_service
+
+    recorded = []
+    scheduled = []
+
+    class FakeService:
+        async def record_sync_state(self, summary, *, status, started_at):
+            recorded.append((summary, status, started_at))
+
+    async def fake_background_sync(**kwargs):
+        scheduled.append(kwargs)
+
+    monkeypatch.setattr(settings, "market_data_cron_secret", "cron-test-secret")
+    monkeypatch.setattr(settings, "market_data_sync_enabled", True)
+    monkeypatch.setattr(
+        sync_api,
+        "_run_all_sync_in_background",
+        fake_background_sync,
+    )
+    app.dependency_overrides[get_sync_service] = lambda: FakeService()
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/internal/market-data/sync/all?discover=true&discovery_offset=200",
+                headers={"X-Cron-Secret": "cron-test-secret"},
+            )
+    finally:
+        app.dependency_overrides.pop(get_sync_service, None)
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job"] == "all"
+    assert body["status"] == "accepted"
+    assert body["status_url"] == "/api/v1/internal/market-data/sync/status"
+    assert len(recorded) == 1
+    assert recorded[0][0].job_id == body["job_id"]
+    assert recorded[0][1] == "running"
+    assert len(scheduled) == 1
+    assert scheduled[0]["discover"] is True
+    assert scheduled[0]["discovery_offset"] == 200
+    assert scheduled[0]["run_id"] == body["job_id"]

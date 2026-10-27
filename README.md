@@ -12,6 +12,12 @@ The Blueprint generates `JWT_SECRET_KEY` and `X_API_KEY`. Clients must send the 
 
 Local development remains separate: start the API with `uvicorn app.main:app --reload` and apply migrations with `alembic upgrade head` after setting local environment variables and starting PostgreSQL.
 
+## Combined market-data sync
+
+Call `POST /api/v1/internal/market-data/sync/all?discover=true&discovery_offset=0` with the `X-Cron-Secret` header. The endpoint returns `202 Accepted` with a `job_id` instead of waiting for all providers to finish. Poll `GET /api/v1/internal/market-data/sync/status` with the same header to follow the combined and individual job statuses; the combined job becomes `success` or `failed` when its child syncs finish. Apply migrations before deploying this behavior.
+
+The sync runs as an in-process FastAPI background task, not a durable queue. If the Render instance restarts while the work is running, the task may be interrupted; call the endpoint again after restart. Use a persistent worker/queue if syncs must survive service restarts.
+
 ## Providers
 
 - **Stocks: TejHQ.** Uses the keyless `GET /v1/ohlcv/{exchange}/{symbol}` endpoint at `https://api.tejhq.dev`, with documented `from` and `to` date parameters. Response rows contain trading date and OHLCV values. The close is stored as `observation_type=eod`, `interval=1d`; the provider returns a date, so `price_timestamp` is that trading date at midnight IST as the daily identity key. This is end-of-day data, not intraday or live data. TejHQ says its feed refreshes around 18:30 IST on trading days, with a retry around 21:30 IST.

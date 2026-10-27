@@ -28,8 +28,8 @@ class MarketDataSyncState(Base):
     last_started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
-    last_finished_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
+    last_finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     last_success_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
