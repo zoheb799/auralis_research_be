@@ -18,6 +18,7 @@ from app.repositories.stock_repository import StockRepository
 from app.schemas.analysis import (
     IPOAnalysisResponse,
     MutualFundAnalysisResponse,
+    StockFinancialMetric,
     StockAnalysisResponse,
 )
 
@@ -233,9 +234,12 @@ async def get_stock_analysis(
     # Validate API response
     # -------------------------
 
-    return StockAnalysisResponse.model_validate(
-        result
-    )
+    result["financial_metrics"] = [
+        StockFinancialMetric.model_validate(metric)
+        for metric in metrics
+    ]
+
+    return StockAnalysisResponse.model_validate(result)
 
 def analyze_ipo_data(
     data: dict[str, Any],

@@ -1,6 +1,7 @@
+from datetime import date
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # -------------------------
@@ -48,6 +49,25 @@ class RiskAnalysis(BaseModel):
     signal: str
 
 
+class StockFinancialMetric(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    period_type: str
+    period_end: date
+    consolidation_type: Optional[str] = None
+    source_provider: Optional[str] = None
+    source_as_of_date: Optional[date] = None
+    shareholder_equity: Optional[float] = None
+    revenue: Optional[float] = None
+    operating_profit: Optional[float] = None
+    net_profit: Optional[float] = None
+    eps: Optional[float] = None
+    total_debt: Optional[float] = None
+    cash: Optional[float] = None
+    roe: Optional[float] = None
+    roce: Optional[float] = None
+
+
 class StockAnalysisResponse(BaseModel):
     growth: GrowthAnalysis
     profitability: ProfitabilityAnalysis
@@ -56,6 +76,9 @@ class StockAnalysisResponse(BaseModel):
     quality: QualityAnalysis
     momentum: MomentumAnalysis
     risk: RiskAnalysis
+    financial_metrics: list[StockFinancialMetric] = Field(
+        default_factory=list
+    )
 
 
 # -------------------------
